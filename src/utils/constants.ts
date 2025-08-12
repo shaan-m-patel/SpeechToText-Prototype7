@@ -3,7 +3,7 @@ export const AUDIO_CONFIG = {
   DEFAULT_SAMPLE_RATE: 16000,
   DEFAULT_CHANNEL_COUNT: 1,
   DEFAULT_BIT_RATE: 128000,
-  CHUNK_DURATION: 10000, // 10 seconds - larger chunks for better API processing
+  CHUNK_DURATION: 4000, // 4 seconds for healthier incremental aggregates
   MAX_RECORDING_DURATION: 600000, // 10 minutes
   SUPPORTED_MIME_TYPES: [
     'audio/webm;codecs=opus',
@@ -15,7 +15,7 @@ export const AUDIO_CONFIG = {
 
 // API constants
 export const API_CONFIG = {
-  FAL_AI_BASE_URL: 'https://fal.run/fal-ai/wizper',
+  // Groq OpenAI-compatible audio endpoints limits (free tier: 25MB, dev tier: 100MB)
   MAX_FILE_SIZE: 25 * 1024 * 1024, // 25MB
   REQUEST_TIMEOUT: 30000, // 30 seconds
   MAX_RETRIES: 3

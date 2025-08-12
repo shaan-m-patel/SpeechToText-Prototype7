@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { Header } from './components/Layout/Header';
 import { PrototypeLayout } from './components/Layout/PrototypeLayout';
 import { AudioControls } from './components/AudioCapture/AudioControls';
@@ -8,8 +8,9 @@ import { useAudioCapture } from './hooks/useAudioCapture';
 import { useTranscription } from './hooks/useTranscription';
 
 function App() {
-  const [apiKey, setApiKey] = useState<string>(import.meta.env.VITE_FAL_AI_API_KEY || '');
-  const [isConfigured, setIsConfigured] = useState<boolean>(!!import.meta.env.VITE_FAL_AI_API_KEY);
+  // Use Groq API key from env (Vite exposes only VITE_* vars)
+  const [apiKey, setApiKey] = useState<string>(import.meta.env.VITE_GROQ_P7_KEY || '');
+  const [isConfigured, setIsConfigured] = useState<boolean>(!!import.meta.env.VITE_GROQ_P7_KEY);
 
   // Audio capture hook
   const {
@@ -26,7 +27,7 @@ function App() {
     clearError,
   } = useAudioCapture();
 
-  // Transcription hook
+  // Transcription hook (Groq STT)
   const {
     segments,
     isProcessing,
@@ -39,38 +40,86 @@ function App() {
     language: import.meta.env.VITE_DEFAULT_LANGUAGE || 'en',
     task: 'transcribe',
     enableTimestamps: true,
+    model: 'whisper-large-v3-turbo',
+    timestampGranularities: ['segment'],
   });
+
+  // Simple in-flight queue to avoid overlapping chunk requests
+  const inFlightRef = useRef(false);
+  const pendingRef = useRef(false);
+  const accumulatedChunksRef = useRef<Blob[]>([]);
+
+  const buildAggregatedBlob = useCallback(() => {
+    // Ensure a single container with the first chunk header
+    return new Blob(accumulatedChunksRef.current, { type: 'audio/webm' });
+  }, []);
+
+  const submitAggregated = useCallback(async () => {
+    if (inFlightRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+    const blob = buildAggregatedBlob();
+    if (!blob || blob.size === 0) return;
+
+    inFlightRef.current = true;
+    try {
+      await processAudio(blob);
+    } catch (e) {
+      console.error('Aggregated transcription failed', e);
+    } finally {
+      inFlightRef.current = false;
+      if (pendingRef.current) {
+        pendingRef.current = false;
+        // Fire next with latest aggregate
+        submitAggregated();
+      }
+    }
+  }, [buildAggregatedBlob, processAudio]);
 
   // Initialize audio on first use
   const handleStartRecording = useCallback(async () => {
     try {
       if (!isConfigured) {
-        alert('Please enter your fal.ai API key first');
+        alert('Please enter your Groq API key first');
         return;
       }
 
+      // reset accumulators
+      accumulatedChunksRef.current = [];
+      inFlightRef.current = false;
+      pendingRef.current = false;
+
       await initialize();
-      // Start recording without chunk processing - we'll process on stop
-      await startRecording();
+      // Start recording and stream aggregate for near real-time transcription
+      await startRecording((chunk) => {
+        if (chunk?.data && chunk.data.size > 0) {
+          accumulatedChunksRef.current.push(chunk.data);
+          submitAggregated();
+        }
+      });
     } catch (error) {
       console.error('Failed to start recording:', error);
     }
-  }, [initialize, startRecording, isConfigured]);
+  }, [initialize, startRecording, isConfigured, submitAggregated]);
 
   const handleStopRecording = useCallback(async () => {
     try {
       const finalBlob = await stopRecording();
       if (finalBlob) {
-        // Process the final complete audio blob
-        await processAudio(finalBlob);
+        // Replace accumulator with the finalized single container
+        accumulatedChunksRef.current = [finalBlob];
+        pendingRef.current = false;
+        inFlightRef.current = false;
+        await submitAggregated();
       }
     } catch (error) {
       console.error('Failed to stop recording:', error);
     }
-  }, [stopRecording, processAudio]);
+  }, [stopRecording, submitAggregated]);
 
   const handleConfigureAPI = useCallback(() => {
-    const key = prompt('Enter your fal.ai API key:');
+    const key = prompt('Enter your Groq API key:');
     if (key) {
       setApiKey(key);
       setIsConfigured(true);
@@ -81,7 +130,7 @@ function App() {
     <PrototypeLayout>
       <Header 
         title="SpeechToText Prototype7" 
-        subtitle="Testing fal.ai Wizper API Integration"
+        subtitle="Using Groq Whisper (OpenAI-compatible)"
       />
       
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -92,10 +141,10 @@ function App() {
               <div>
                 <h3 className="text-sm font-medium text-blue-900">API Configuration Required</h3>
                 <p className="text-sm text-blue-700 mt-1">
-                  You need to configure your fal.ai API key. You can either add it to your .env.local file or enter it manually.
+                  Add your Groq API key to your .env.local file or enter it manually.
                 </p>
                 <p className="text-xs text-blue-600 mt-1">
-                  Tip: Add VITE_FAL_AI_API_KEY=your_key to .env.local for automatic loading
+                  Tip: Add VITE_GROQ_P7_KEY=your_key to .env.local for automatic loading
                 </p>
               </div>
               <button
@@ -122,7 +171,7 @@ function App() {
             <div className="flex items-center space-x-2 text-sm text-gray-600">
               <div className="w-2 h-2 bg-green-500 rounded-full"></div>
               <span>
-                API Configured {import.meta.env.VITE_FAL_AI_API_KEY ? '(from .env.local)' : '(manual)'}
+                API Configured {import.meta.env.VITE_GROQ_P7_KEY ? '(from .env.local)' : '(manual)'}
               </span>
             </div>
           )}
@@ -149,11 +198,10 @@ function App() {
             <div className="bg-gray-50 rounded-lg p-4">
               <h3 className="text-sm font-medium text-gray-900 mb-2">Instructions</h3>
               <ul className="text-sm text-gray-600 space-y-1">
-                <li>• Configure your fal.ai API key first</li>
+                <li>• Configure your Groq API key first</li>
                 <li>• Click "Start Recording" to begin audio capture</li>
-                <li>• Speak clearly into your microphone</li>
-                <li>• Click "Stop" to finish recording and get transcript</li>
-                <li>• Processing happens after recording stops for better accuracy</li>
+                <li>• Live transcript updates every few seconds while recording</li>
+                <li>• Click "Stop" to finalize and capture any trailing audio</li>
               </ul>
             </div>
           </div>

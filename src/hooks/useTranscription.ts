@@ -1,10 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
-import { WizperAPI, WizperConfig } from '../services/wizperAPI';
+import { GroqSTT, GroqConfig } from '../services/groqSTT.ts';
 import { TranscriptSegment, TranscriptState, WizperResponse } from '../types/transcript';
 import { generateSegmentId } from '../utils/audioFormat';
-import { UI_CONFIG } from '../utils/constants';
 
-export function useTranscription(config: WizperConfig) {
+export function useTranscription(config: GroqConfig) {
   const [state, setState] = useState<TranscriptState>({
     segments: [],
     isProcessing: false,
@@ -13,63 +12,64 @@ export function useTranscription(config: WizperConfig) {
     averageConfidence: 0,
   });
 
-  const wizperRef = useRef<WizperAPI | null>(null);
-  const processingTimeoutRef = useRef<number | null>(null);
+  const groqRef = useRef<GroqSTT | null>(null);
 
-  // Initialize Wizper API
-  const initializeWizper = useCallback(() => {
-    if (!wizperRef.current) {
-      wizperRef.current = new WizperAPI(config);
+  // Initialize Groq STT API
+  const initializeGroq = useCallback(() => {
+    if (!groqRef.current) {
+      groqRef.current = new GroqSTT(config);
     }
   }, [config]);
 
-  // Process audio blob and add to transcript
+  // Process audio blob and update transcript (replace with aggregated response)
   const processAudio = useCallback(async (audioBlob: Blob): Promise<void> => {
-    initializeWizper();
+    initializeGroq();
     
-    if (!wizperRef.current) {
-      throw new Error('Wizper API not initialized');
+    if (!groqRef.current) {
+      throw new Error('Groq STT not initialized');
     }
 
-    setState(prev => ({ ...prev, isProcessing: true }));
-
-    // Add a processing segment placeholder
-    const processingSegment: TranscriptSegment = {
-      id: generateSegmentId(),
-      text: 'Processing...',
-      timestamp: Date.now(),
-      confidence: 0,
-      startTime: state.totalDuration,
-      endTime: state.totalDuration,
-      isProcessing: true,
-    };
-
-    setState(prev => ({
-      ...prev,
-      segments: [...prev.segments, processingSegment],
-    }));
+    // Set processing state and add a single placeholder if none exists
+    setState(prev => {
+      const hasProcessing = prev.segments.some(s => s.isProcessing);
+      const nextSegments = hasProcessing
+        ? prev.segments
+        : [
+            ...prev.segments,
+            {
+              id: generateSegmentId(),
+              text: 'Processing...',
+              timestamp: Date.now(),
+              confidence: 0,
+              startTime: prev.totalDuration,
+              endTime: prev.totalDuration,
+              isProcessing: true,
+            } as TranscriptSegment,
+          ];
+      return { ...prev, isProcessing: true, segments: nextSegments };
+    });
 
     try {
-      const response: WizperResponse = await wizperRef.current.transcribe(audioBlob);
-      
-      // Remove processing segment and add real segments
+      const response: WizperResponse = await groqRef.current.transcribe(audioBlob);
+
+      // Build new segments from absolute timestamps (replace entire list)
+      const newSegments = createSegmentsFromResponse(response);
+
       setState(prev => {
-        const segmentsWithoutProcessing = prev.segments.filter(s => !s.isProcessing);
-        const newSegments = createSegmentsFromResponse(response, prev.totalDuration);
-        const allSegments = [...segmentsWithoutProcessing, ...newSegments];
-        
+        const totalDuration = Math.max(prev.totalDuration, response.duration || 0);
+        const wordCount = calculateWordCount(newSegments);
+        const averageConfidence = calculateAverageConfidence(newSegments);
         return {
-          ...prev,
-          segments: allSegments,
+          segments: newSegments,
           isProcessing: false,
-          wordCount: calculateWordCount(allSegments),
-          averageConfidence: calculateAverageConfidence(allSegments),
-          totalDuration: prev.totalDuration + (response.duration || 0),
+          totalDuration,
+          wordCount,
+          averageConfidence,
         };
       });
 
     } catch (error) {
-      // Remove processing segment and show error
+      // Remove any processing placeholders
       setState(prev => ({
         ...prev,
         segments: prev.segments.filter(s => !s.isProcessing),
@@ -78,7 +78,7 @@ export function useTranscription(config: WizperConfig) {
       
       throw error;
     }
-  }, [initializeWizper, state.totalDuration]);
+  }, [initializeGroq]);
 
   // Add a manual transcript segment (for testing or manual input)
   const addSegment = useCallback((text: string, confidence: number = 1.0): void => {
@@ -92,13 +92,13 @@ export function useTranscription(config: WizperConfig) {
     };
 
     setState(prev => {
-      const newSegments = [...prev.segments, segment];
+      const newSegments = [...prev.segments, segment].filter(s => !s.isProcessing);
       return {
         ...prev,
         segments: newSegments,
         wordCount: calculateWordCount(newSegments),
         averageConfidence: calculateAverageConfidence(newSegments),
-        totalDuration: prev.totalDuration + 2,
+        totalDuration: Math.max(prev.totalDuration, segment.endTime),
       };
     });
   }, [state.totalDuration]);
@@ -118,14 +118,15 @@ export function useTranscription(config: WizperConfig) {
   const getTranscriptText = useCallback((): string => {
     return state.segments
       .filter(s => !s.isProcessing)
+      .sort((a, b) => a.startTime - b.startTime)
       .map(s => s.text)
       .join(' ');
   }, [state.segments]);
 
-  // Update Wizper configuration
-  const updateConfig = useCallback((newConfig: Partial<WizperConfig>): void => {
-    if (wizperRef.current) {
-      wizperRef.current.updateConfig(newConfig);
+  // Update Groq configuration
+  const updateConfig = useCallback((newConfig: Partial<GroqConfig>): void => {
+    if (groqRef.current) {
+      groqRef.current.updateConfig(newConfig);
     }
   }, []);
 
@@ -140,26 +141,26 @@ export function useTranscription(config: WizperConfig) {
 }
 
 // Helper functions
-function createSegmentsFromResponse(response: WizperResponse, startTime: number): TranscriptSegment[] {
+function createSegmentsFromResponse(response: WizperResponse): TranscriptSegment[] {
   if (response.segments && response.segments.length > 0) {
     return response.segments.map((segment, index) => ({
       id: generateSegmentId(),
       text: segment.text.trim(),
       timestamp: Date.now() + index,
       confidence: segment.confidence || 0.9,
-      startTime: startTime + (segment.start || 0),
-      endTime: startTime + (segment.end || 0),
+      startTime: segment.start || 0,
+      endTime: segment.end || (segment.start || 0),
     }));
   }
 
   // Fallback: create a single segment from the full text
   return [{
     id: generateSegmentId(),
-    text: response.text.trim(),
+    text: (response.text || '').trim(),
     timestamp: Date.now(),
     confidence: 0.9,
-    startTime,
-    endTime: startTime + (response.duration || 2),
+    startTime: 0,
+    endTime: response.duration || 0,
   }];
 }
 

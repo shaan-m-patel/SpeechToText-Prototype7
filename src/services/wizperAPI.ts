@@ -2,6 +2,9 @@ import { WizperResponse, WizperError } from '../types/transcript';
 import { API_CONFIG } from '../utils/constants';
 import { fal } from '@fal-ai/client';
 
+// NOTE: Deprecated in favor of GroqSTT (see src/services/groqSTT.ts)
+// Keeping this file for reference/testing. New code should use GroqSTT.
+
 export interface WizperConfig {
   apiKey: string;
   language?: string;
