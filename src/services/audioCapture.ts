@@ -43,6 +43,35 @@ export class AudioCaptureService {
   }
 
   /**
+   * Initialize with an externally provided MediaStream (e.g., getDisplayMedia with audio)
+   */
+  async initializeWithStream(stream: MediaStream): Promise<void> {
+    try {
+      this.audioStream = stream;
+
+      // If the display stream ends, stop recording if active
+      const audioTracks = this.audioStream.getAudioTracks();
+      if (!audioTracks || audioTracks.length === 0) {
+        throw this.createAudioError(
+          'DEVICE_NOT_FOUND',
+          'No audio track in shared stream. In the share dialog, enable "Share tab audio".'
+        );
+      }
+      audioTracks.forEach((t) => {
+        // Browsers may emit ended on track when user stops sharing
+        t.addEventListener('ended', () => {
+          try { this.mediaRecorder?.state === 'recording' && this.mediaRecorder?.stop(); } catch {}
+        });
+      });
+
+      this.setupMediaRecorder();
+    } catch (error) {
+      if ((error as any)?.type) throw error as any;
+      throw this.createAudioError('DEVICE_NOT_FOUND', 'Failed to initialize with provided stream', error as Error);
+    }
+  }
+
+  /**
    * Start recording audio
    */
   async startRecording(onChunk?: (chunk: AudioChunk) => void): Promise<void> {

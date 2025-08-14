@@ -3,7 +3,7 @@ import { GroqSTT, GroqConfig } from '../services/groqSTT.ts';
 import { TranscriptSegment, TranscriptState, WizperResponse } from '../types/transcript';
 import { generateSegmentId } from '../utils/audioFormat';
 
-export function useTranscription(config: GroqConfig) {
+export function useTranscription(config: GroqConfig & { sourceId?: 'mic' | 'share'; appendMode?: boolean }) {
   const [state, setState] = useState<TranscriptState>({
     segments: [],
     isProcessing: false,
@@ -21,7 +21,7 @@ export function useTranscription(config: GroqConfig) {
     }
   }, [config]);
 
-  // Process audio blob and update transcript (replace with aggregated response)
+  // Process audio blob. In appendMode, we append/update instead of replacing all segments.
   const processAudio = useCallback(async (audioBlob: Blob): Promise<void> => {
     initializeGroq();
     
@@ -29,52 +29,37 @@ export function useTranscription(config: GroqConfig) {
       throw new Error('Groq STT not initialized');
     }
 
-    // Set processing state and add a single placeholder if none exists
-    setState(prev => {
-      const hasProcessing = prev.segments.some(s => s.isProcessing);
-      const nextSegments = hasProcessing
-        ? prev.segments
-        : [
-            ...prev.segments,
-            {
-              id: generateSegmentId(),
-              text: 'Processing...',
-              timestamp: Date.now(),
-              confidence: 0,
-              startTime: prev.totalDuration,
-              endTime: prev.totalDuration,
-              isProcessing: true,
-            } as TranscriptSegment,
-          ];
-      return { ...prev, isProcessing: true, segments: nextSegments };
-    });
+    // Set processing state; in append mode, indicate pending but don't add placeholder bubble
+    setState(prev => ({ ...prev, isProcessing: true }));
 
     try {
       const response: WizperResponse = await groqRef.current.transcribe(audioBlob);
 
-      // Build new segments from absolute timestamps (replace entire list)
-      const newSegments = createSegmentsFromResponse(response);
-
-      setState(prev => {
-        const totalDuration = Math.max(prev.totalDuration, response.duration || 0);
-        const wordCount = calculateWordCount(newSegments);
-        const averageConfidence = calculateAverageConfidence(newSegments);
-        return {
-          segments: newSegments,
-          isProcessing: false,
-          totalDuration,
-          wordCount,
-          averageConfidence,
-        };
-      });
+      if (config.appendMode) {
+        const appended = squashSegments(createSegmentsFromResponse(response, config.sourceId));
+        setState(prev => {
+          const next = mergeIncremental(prev.segments, appended);
+          return recalcState({ ...prev, isProcessing: false, segments: next }, response.duration);
+        });
+      } else {
+        // Replace entire list (legacy behavior)
+        const newSegments = squashSegments(createSegmentsFromResponse(response, config.sourceId));
+        setState(prev => {
+          const totalDuration = Math.max(prev.totalDuration, response.duration || 0);
+          const wordCount = calculateWordCount(newSegments);
+          const averageConfidence = calculateAverageConfidence(newSegments);
+          return {
+            segments: newSegments,
+            isProcessing: false,
+            totalDuration,
+            wordCount,
+            averageConfidence,
+          };
+        });
+      }
 
     } catch (error) {
-      // Remove any processing placeholders
-      setState(prev => ({
-        ...prev,
-        segments: prev.segments.filter(s => !s.isProcessing),
-        isProcessing: false,
-      }));
+      setState(prev => ({ ...prev, isProcessing: false }));
       
       throw error;
     }
@@ -141,7 +126,7 @@ export function useTranscription(config: GroqConfig) {
 }
 
 // Helper functions
-function createSegmentsFromResponse(response: WizperResponse): TranscriptSegment[] {
+function createSegmentsFromResponse(response: WizperResponse, sourceId?: 'mic' | 'share'): TranscriptSegment[] {
   if (response.segments && response.segments.length > 0) {
     return response.segments.map((segment, index) => ({
       id: generateSegmentId(),
@@ -150,6 +135,8 @@ function createSegmentsFromResponse(response: WizperResponse): TranscriptSegment
       confidence: segment.confidence || 0.9,
       startTime: segment.start || 0,
       endTime: segment.end || (segment.start || 0),
+      sourceId,
+      isFinal: true,
     }));
   }
 
@@ -161,6 +148,8 @@ function createSegmentsFromResponse(response: WizperResponse): TranscriptSegment
     confidence: 0.9,
     startTime: 0,
     endTime: response.duration || 0,
+    sourceId,
+    isFinal: true,
   }];
 }
 
@@ -178,4 +167,68 @@ function calculateAverageConfidence(segments: TranscriptSegment[]): number {
   
   const totalConfidence = validSegments.reduce((sum, segment) => sum + segment.confidence, 0);
   return totalConfidence / validSegments.length;
+}
+
+// Merge new segments into existing list, deduping identical text ranges per source by time
+function mergeIncremental(existing: TranscriptSegment[], incoming: TranscriptSegment[]): TranscriptSegment[] {
+  if (incoming.length === 0) return existing;
+
+  const next = [...existing];
+  for (const seg of incoming) {
+    // Try to find an equivalent segment (same source, overlapping time, similar text)
+    const idx = next.findIndex(s => s.sourceId === seg.sourceId && Math.abs(s.startTime - seg.startTime) < 0.2 && Math.abs(s.endTime - seg.endTime) < 0.2);
+    if (idx >= 0) {
+      next[idx] = { ...seg };
+    } else {
+      next.push(seg);
+    }
+  }
+  // Keep stable order by time
+  return next.sort((a, b) => a.startTime - b.startTime || a.timestamp - b.timestamp);
+}
+
+function recalcState(state: TranscriptState, duration?: number): TranscriptState {
+  const wordCount = calculateWordCount(state.segments);
+  const averageConfidence = calculateAverageConfidence(state.segments);
+  const totalDuration = Math.max(state.totalDuration, duration || 0);
+  return { ...state, wordCount, averageConfidence, totalDuration };
+}
+
+// Utilities to squash repeated/fragmented segments from ASR responses
+function normalizeText(t: string): string {
+  return t
+    .toLowerCase()
+    .replace(/[-–—]/g, '') // remove hyphens/dashes
+    .replace(/[^a-z0-9\s]/g, '') // strip punctuation
+    .replace(/\s+/g, ' ') // collapse spaces
+    .trim();
+}
+
+function squashSegments(segments: TranscriptSegment[]): TranscriptSegment[] {
+  const out: TranscriptSegment[] = [];
+  for (const seg of segments.sort((a, b) => a.startTime - b.startTime)) {
+    const curNorm = normalizeText(seg.text);
+    if (!curNorm) continue;
+
+    const last = out[out.length - 1];
+    if (last) {
+      const lastNorm = normalizeText(last.text);
+      // Drop if identical text from same source, or fragment fully contained in last
+      const isIdentical = lastNorm === curNorm;
+      const isContained = lastNorm.includes(curNorm) || curNorm.includes(lastNorm);
+      const closeInTime = Math.abs(seg.startTime - last.endTime) < 1.0; // 1s boundary
+      if (isIdentical || (isContained && closeInTime)) {
+        // Extend last timing to the newer end
+        last.endTime = Math.max(last.endTime, seg.endTime);
+        continue;
+      }
+      // Collapse very short fragments that are likely artifacts
+      if (curNorm.length < 6 && lastNorm.endsWith(curNorm) && closeInTime) {
+        last.endTime = Math.max(last.endTime, seg.endTime);
+        continue;
+      }
+    }
+    out.push({ ...seg });
+  }
+  return out;
 }

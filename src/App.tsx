@@ -4,7 +4,9 @@ import { PrototypeLayout } from './components/Layout/PrototypeLayout';
 import { AudioControls } from './components/AudioCapture/AudioControls';
 import { RecordingStatus } from './components/AudioCapture/RecordingStatus';
 import { TranscriptDisplay } from './components/Transcript/TranscriptDisplay';
+import { ChatThread } from './components/Transcript/ChatThread';
 import { useAudioCapture } from './hooks/useAudioCapture';
+import { useDisplayAudioCapture } from './hooks/useDisplayAudioCapture';
 import { useTranscription } from './hooks/useTranscription';
 
 function App() {
@@ -12,7 +14,7 @@ function App() {
   const [apiKey, setApiKey] = useState<string>(import.meta.env.VITE_GROQ_P7_KEY || '');
   const [isConfigured, setIsConfigured] = useState<boolean>(!!import.meta.env.VITE_GROQ_P7_KEY);
 
-  // Audio capture hook
+  // Mic capture
   const {
     isRecording,
     isPaused,
@@ -27,55 +29,93 @@ function App() {
     clearError,
   } = useAudioCapture();
 
+  // Display/tab audio capture
+  const {
+    isRecording: isShareRecording,
+    isPaused: isSharePaused,
+    totalDuration: shareDuration,
+    error: shareError,
+    initialize: initializeShare,
+    startRecording: startShareRecording,
+    stopRecording: stopShareRecording,
+    pauseRecording: pauseShareRecording,
+    resumeRecording: resumeShareRecording,
+  } = useDisplayAudioCapture();
+
   // Transcription hook (Groq STT)
   const {
-    segments,
-    isProcessing,
-    wordCount,
-    averageConfidence,
-    processAudio,
-    clearTranscript,
+    segments: micSegments,
+    isProcessing: isMicProcessing,
+    wordCount: micWordCount,
+    averageConfidence: micAvgConf,
+    processAudio: processMicAudio,
+    clearTranscript: clearMicTranscript,
   } = useTranscription({
     apiKey,
     language: import.meta.env.VITE_DEFAULT_LANGUAGE || 'en',
     task: 'transcribe',
     enableTimestamps: true,
     model: 'whisper-large-v3-turbo',
-    timestampGranularities: ['segment'],
+  timestampGranularities: ['segment', 'word'],
+    sourceId: 'mic',
+  appendMode: false,
+  });
+
+  const {
+    segments: shareSegments,
+    isProcessing: isShareProcessing,
+    wordCount: shareWordCount,
+    averageConfidence: shareAvgConf,
+    processAudio: processShareAudio,
+    clearTranscript: clearShareTranscript,
+  } = useTranscription({
+    apiKey,
+    language: import.meta.env.VITE_DEFAULT_LANGUAGE || 'en',
+    task: 'transcribe',
+    enableTimestamps: true,
+    model: 'whisper-large-v3-turbo',
+  timestampGranularities: ['segment', 'word'],
+    sourceId: 'share',
+  appendMode: false,
   });
 
   // Simple in-flight queue to avoid overlapping chunk requests
-  const inFlightRef = useRef(false);
-  const pendingRef = useRef(false);
-  const accumulatedChunksRef = useRef<Blob[]>([]);
+  // Per-source in-flight queues
+  const inFlightRefMic = useRef(false);
+  const pendingRefMic = useRef(false);
+  const accumulatedChunksRefMic = useRef<Blob[]>([]);
 
-  const buildAggregatedBlob = useCallback(() => {
-    // Ensure a single container with the first chunk header
-    return new Blob(accumulatedChunksRef.current, { type: 'audio/webm' });
-  }, []);
+  const inFlightRefShare = useRef(false);
+  const pendingRefShare = useRef(false);
+  const accumulatedChunksRefShare = useRef<Blob[]>([]);
 
-  const submitAggregated = useCallback(async () => {
-    if (inFlightRef.current) {
-      pendingRef.current = true;
-      return;
-    }
-    const blob = buildAggregatedBlob();
+  const buildAggregatedBlob = useCallback((chunks: Blob[]) => new Blob(chunks, { type: 'audio/webm' }), []);
+
+  const submitAggregatedMic = useCallback(async () => {
+    if (inFlightRefMic.current) { pendingRefMic.current = true; return; }
+    const blob = buildAggregatedBlob(accumulatedChunksRefMic.current);
     if (!blob || blob.size === 0) return;
-
-    inFlightRef.current = true;
-    try {
-      await processAudio(blob);
-    } catch (e) {
-      console.error('Aggregated transcription failed', e);
-    } finally {
-      inFlightRef.current = false;
-      if (pendingRef.current) {
-        pendingRef.current = false;
-        // Fire next with latest aggregate
-        submitAggregated();
-      }
+    inFlightRefMic.current = true;
+    try { await processMicAudio(blob); }
+    catch (e) { console.error('Mic aggregated transcription failed', e); }
+    finally {
+      inFlightRefMic.current = false;
+      if (pendingRefMic.current) { pendingRefMic.current = false; submitAggregatedMic(); }
     }
-  }, [buildAggregatedBlob, processAudio]);
+  }, [buildAggregatedBlob, processMicAudio]);
+
+  const submitAggregatedShare = useCallback(async () => {
+    if (inFlightRefShare.current) { pendingRefShare.current = true; return; }
+    const blob = buildAggregatedBlob(accumulatedChunksRefShare.current);
+    if (!blob || blob.size === 0) return;
+    inFlightRefShare.current = true;
+    try { await processShareAudio(blob); }
+    catch (e) { console.error('Share aggregated transcription failed', e); }
+    finally {
+      inFlightRefShare.current = false;
+      if (pendingRefShare.current) { pendingRefShare.current = false; submitAggregatedShare(); }
+    }
+  }, [buildAggregatedBlob, processShareAudio]);
 
   // Initialize audio on first use
   const handleStartRecording = useCallback(async () => {
@@ -85,38 +125,71 @@ function App() {
         return;
       }
 
-      // reset accumulators
-      accumulatedChunksRef.current = [];
-      inFlightRef.current = false;
-      pendingRef.current = false;
+      // reset accumulators (mic)
+      accumulatedChunksRefMic.current = [];
+      inFlightRefMic.current = false;
+      pendingRefMic.current = false;
 
       await initialize();
       // Start recording and stream aggregate for near real-time transcription
       await startRecording((chunk) => {
         if (chunk?.data && chunk.data.size > 0) {
-          accumulatedChunksRef.current.push(chunk.data);
-          submitAggregated();
+          accumulatedChunksRefMic.current.push(chunk.data);
+          submitAggregatedMic();
         }
       });
     } catch (error) {
       console.error('Failed to start recording:', error);
     }
-  }, [initialize, startRecording, isConfigured, submitAggregated]);
+  }, [initialize, startRecording, isConfigured, submitAggregatedMic]);
 
   const handleStopRecording = useCallback(async () => {
     try {
       const finalBlob = await stopRecording();
       if (finalBlob) {
         // Replace accumulator with the finalized single container
-        accumulatedChunksRef.current = [finalBlob];
-        pendingRef.current = false;
-        inFlightRef.current = false;
-        await submitAggregated();
+        accumulatedChunksRefMic.current = [finalBlob];
+        pendingRefMic.current = false;
+        inFlightRefMic.current = false;
+        await submitAggregatedMic();
       }
     } catch (error) {
       console.error('Failed to stop recording:', error);
     }
-  }, [stopRecording, submitAggregated]);
+  }, [stopRecording, submitAggregatedMic]);
+
+  // Display share handlers
+  const handleStartShare = useCallback(async () => {
+    try {
+      if (!isConfigured) { alert('Please enter your Groq API key first'); return; }
+      accumulatedChunksRefShare.current = [];
+      inFlightRefShare.current = false;
+      pendingRefShare.current = false;
+      await initializeShare();
+      await startShareRecording((chunk) => {
+        if (chunk?.data && chunk.data.size > 0) {
+          accumulatedChunksRefShare.current.push(chunk.data);
+          submitAggregatedShare();
+        }
+      });
+    } catch (e) {
+      console.error('Failed to start share recording:', e);
+    }
+  }, [initializeShare, startShareRecording, isConfigured, submitAggregatedShare]);
+
+  const handleStopShare = useCallback(async () => {
+    try {
+      const finalBlob = await stopShareRecording();
+      if (finalBlob) {
+        accumulatedChunksRefShare.current = [finalBlob];
+        pendingRefShare.current = false;
+        inFlightRefShare.current = false;
+        await submitAggregatedShare();
+      }
+    } catch (e) {
+      console.error('Failed to stop share recording:', e);
+    }
+  }, [stopShareRecording, submitAggregatedShare]);
 
   const handleConfigureAPI = useCallback(() => {
     const key = prompt('Enter your Groq API key:');
@@ -162,7 +235,7 @@ function App() {
           <RecordingStatus
             isRecording={isRecording}
             isPaused={isPaused}
-            isProcessing={isProcessing}
+            isProcessing={isMicProcessing || isShareProcessing}
             duration={totalDuration}
             error={audioError || undefined}
           />
@@ -194,6 +267,29 @@ function App() {
               onClearError={clearError}
             />
 
+            {/* Share Controls */}
+            <div className="bg-white rounded-lg shadow-sm border p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-semibold text-gray-900">Share Audio Controls</h2>
+                <div className="text-sm text-gray-500">Duration: {Math.round(shareDuration)}s</div>
+              </div>
+              {shareError && (
+                <div className="mb-3 text-sm text-red-600">{shareError}</div>
+              )}
+              <div className="flex items-center space-x-3">
+                {!isShareRecording ? (
+                  <button className="btn-primary" onClick={handleStartShare}>Start Share Audio</button>
+                ) : (
+                  <>
+                    <button className="btn-secondary" onClick={pauseShareRecording} disabled={isSharePaused}>Pause</button>
+                    <button className="btn-secondary" onClick={resumeShareRecording} disabled={!isSharePaused}>Resume</button>
+                    <button className="btn-danger" onClick={handleStopShare}>Stop</button>
+                  </>
+                )}
+              </div>
+              <p className="text-xs text-gray-500 mt-2">Tip: When choosing a tab/window, enable "Share tab audio".</p>
+            </div>
+
             {/* Instructions */}
             <div className="bg-gray-50 rounded-lg p-4">
               <h3 className="text-sm font-medium text-gray-900 mb-2">Instructions</h3>
@@ -206,15 +302,32 @@ function App() {
             </div>
           </div>
 
-          {/* Transcript Panel */}
-          <div>
-            <TranscriptDisplay
-              segments={segments}
-              isProcessing={isProcessing}
-              wordCount={wordCount}
-              averageConfidence={averageConfidence}
-              onClearTranscript={clearTranscript}
-            />
+          {/* Chat Thread Panel */}
+          <div className="space-y-4">
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 mb-2">Chat Transcript</h2>
+              <ChatThread micSegments={micSegments} shareSegments={shareSegments} />
+            </div>
+            <div>
+              <h3 className="text-sm font-medium text-gray-700 mb-1">Debug: Mic Transcript</h3>
+              <TranscriptDisplay
+                segments={micSegments}
+                isProcessing={isMicProcessing}
+                wordCount={micWordCount}
+                averageConfidence={micAvgConf}
+                onClearTranscript={clearMicTranscript}
+              />
+            </div>
+            <div>
+              <h3 className="text-sm font-medium text-gray-700 mb-1">Debug: Share Transcript</h3>
+              <TranscriptDisplay
+                segments={shareSegments}
+                isProcessing={isShareProcessing}
+                wordCount={shareWordCount}
+                averageConfidence={shareAvgConf}
+                onClearTranscript={clearShareTranscript}
+              />
+            </div>
           </div>
         </div>
 
@@ -225,8 +338,10 @@ function App() {
             <div className="text-xs text-gray-600 space-y-1">
               <div>Recording: {isRecording ? 'Yes' : 'No'}</div>
               <div>Paused: {isPaused ? 'Yes' : 'No'}</div>
-              <div>Processing: {isProcessing ? 'Yes' : 'No'}</div>
-              <div>Segments: {segments.length}</div>
+              <div>Mic Processing: {isMicProcessing ? 'Yes' : 'No'}</div>
+              <div>Mic Segments: {micSegments.length}</div>
+              <div>Share Processing: {isShareProcessing ? 'Yes' : 'No'}</div>
+              <div>Share Segments: {shareSegments.length}</div>
               <div>Audio Level: {Math.round(audioLevel)}%</div>
               <div>Duration: {Math.round(totalDuration)}s</div>
               {audioError && <div className="text-red-600">Error: {audioError}</div>}

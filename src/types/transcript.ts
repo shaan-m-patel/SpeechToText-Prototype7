@@ -8,6 +8,10 @@ export interface TranscriptSegment {
   startTime: number;
   endTime: number;
   isProcessing?: boolean;
+  /** Which source produced this segment (for chat bubble styling) */
+  sourceId?: 'mic' | 'share';
+  /** Optional flag to indicate the segment won't change anymore */
+  isFinal?: boolean;
 }
 
 export interface TranscriptState {

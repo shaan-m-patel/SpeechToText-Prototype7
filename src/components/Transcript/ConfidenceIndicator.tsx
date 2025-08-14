@@ -1,5 +1,4 @@
 import React from 'react';
-import { TranscriptSegment } from '../../types/transcript';
 
 interface ConfidenceIndicatorProps {
   confidence: number;
