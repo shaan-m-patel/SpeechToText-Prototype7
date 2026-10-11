@@ -1,5 +1,6 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { GroqSTT, GroqConfig } from '../services/groqSTT.ts';
+import { isAbortError } from '../services/groqRetry';
 import { TranscriptSegment, TranscriptState, WizperResponse } from '../types/transcript';
 import { generateSegmentId } from '../utils/audioFormat';
 
@@ -13,37 +14,51 @@ export function useTranscription(config: GroqConfig & { sourceId?: 'mic' | 'shar
   });
 
   const groqRef = useRef<GroqSTT | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const configRef = useRef(config);
+  configRef.current = config;
 
-  // Initialize Groq STT API
-  const initializeGroq = useCallback(() => {
-    if (!groqRef.current) {
-      groqRef.current = new GroqSTT(config);
-    }
-  }, [config]);
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
 
   // Process audio blob. In appendMode, we append/update instead of replacing all segments.
   const processAudio = useCallback(async (audioBlob: Blob): Promise<void> => {
-    initializeGroq();
-    
+    const activeConfig = configRef.current;
     if (!groqRef.current) {
-      throw new Error('Groq STT not initialized');
+      groqRef.current = new GroqSTT(activeConfig);
+    } else {
+      groqRef.current.updateConfig(activeConfig);
     }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     // Set processing state; in append mode, indicate pending but don't add placeholder bubble
     setState(prev => ({ ...prev, isProcessing: true }));
 
     try {
-      const response: WizperResponse = await groqRef.current.transcribe(audioBlob);
+      const response: WizperResponse = await groqRef.current.transcribe(audioBlob, controller.signal);
+      if (controller.signal.aborted) {
+        setState(prev => ({ ...prev, isProcessing: false }));
+        return;
+      }
 
-      if (config.appendMode) {
-        const appended = squashSegments(createSegmentsFromResponse(response, config.sourceId));
+      if (activeConfig.appendMode) {
+        const appended = squashSegments(createSegmentsFromResponse(response, activeConfig.sourceId));
         setState(prev => {
           const next = mergeIncremental(prev.segments, appended);
           return recalcState({ ...prev, isProcessing: false, segments: next }, response.duration);
         });
       } else {
         // Replace entire list (legacy behavior)
-        const newSegments = squashSegments(createSegmentsFromResponse(response, config.sourceId));
+        const newSegments = squashSegments(createSegmentsFromResponse(response, activeConfig.sourceId));
         setState(prev => {
           const totalDuration = Math.max(prev.totalDuration, response.duration || 0);
           const wordCount = calculateWordCount(newSegments);
@@ -60,10 +75,12 @@ export function useTranscription(config: GroqConfig & { sourceId?: 'mic' | 'shar
 
     } catch (error) {
       setState(prev => ({ ...prev, isProcessing: false }));
-      
+      if (isAbortError(error) || controller.signal.aborted) return;
       throw error;
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
     }
-  }, [initializeGroq]);
+  }, []);
 
   // Add a manual transcript segment (for testing or manual input)
   const addSegment = useCallback((text: string, confidence: number = 1.0): void => {
@@ -118,6 +135,7 @@ export function useTranscription(config: GroqConfig & { sourceId?: 'mic' | 'shar
   return {
     ...state,
     processAudio,
+    cancel,
     addSegment,
     clearTranscript,
     getTranscriptText,

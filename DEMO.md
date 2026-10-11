@@ -44,8 +44,8 @@ The prototype is now ready for testing. Here's what has been implemented:
    - Grant microphone permissions when prompted
 
 3. **Configure API Key**
-   - Click "Configure API Key" button
-   - Enter your fal.ai API key (get one from https://fal.ai/)
+   - Set `GROQ_P7_KEY` in `.env.local` and restart the dev server, or click "Enter API Key" for this browser session only
+   - The key stays on the server or in memory. It is not compiled into the page. See `API_SETUP.md`.
 
 4. **Test Recording**
    - Click "Start Recording"

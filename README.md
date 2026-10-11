@@ -38,7 +38,7 @@ This prototype is designed to:
 ## 📋 Prerequisites
 
 1. **Node.js**: Version 16 or higher
-2. **fal.ai API Key**: You'll need a valid API key from [fal.ai](https://fal.ai/)
+2. **Groq API Key**: Set `GROQ_P7_KEY` for the dev server, or enter a key for the current browser session. See [API_SETUP.md](API_SETUP.md). The key is not compiled into the client bundle.
 3. **Modern Browser**: Chrome, Firefox, or Safari with microphone support
 
 ## ⚡ Quick Start
@@ -58,8 +58,8 @@ This prototype is designed to:
    - Allow microphone permissions when prompted
 
 4. **Configure API**
-   - Click "Configure API Key" in the interface
-   - Enter your fal.ai API key
+   - Put `GROQ_P7_KEY` in `.env.local` and restart `npm run dev`, or
+   - Click "Enter API Key" to use a key for this browser session only
 
 5. **Test Recording**
    - Click "Start Recording"
@@ -99,9 +99,7 @@ src/
 ## 🔧 Configuration
 
 ### API Configuration
-The app requires a fal.ai API key to function. You can:
-- Enter it through the UI prompt
-- Set it as an environment variable (future enhancement)
+The app transcribes through a same-origin `/api/stt` proxy. Set `GROQ_P7_KEY` in the server environment, or enter a session key in the browser. Do not put the Groq key in a `VITE_` variable. Details are in [API_SETUP.md](API_SETUP.md).
 
 ### Audio Settings
 Audio capture uses these default settings:
@@ -173,7 +171,7 @@ npm run preview
 ## 🐛 Known Issues
 
 - Audio chunks may not process in exact real-time on slower connections
-- API rate limiting may affect continuous recording
+- API rate limiting may affect continuous recording. Failed Groq responses stop after three retries, 4xx errors other than 429 are not retried, and Stop aborts the in-flight upload. Recording also stops at 10 minutes.
 - Some browsers require HTTPS for microphone access
 
 ## 📄 License

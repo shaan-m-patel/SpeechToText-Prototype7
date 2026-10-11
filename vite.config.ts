@@ -1,15 +1,30 @@
-import { defineConfig, loadEnv } from 'vite'
+import { defineConfig, loadEnv, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
+import { createGroqProxy, resolveGroqServerKey } from './server/groqProxy'
 
-// https://vitejs.dev/config/
-export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), '')
+function groqProxyPlugin(): Plugin {
+  const attach = (middlewares: { use: (handler: ReturnType<typeof createGroqProxy>) => void }, mode: string) => {
+    middlewares.use(createGroqProxy({
+      getServerKey: () => resolveGroqServerKey(loadEnv(mode, process.cwd(), '')),
+    }))
+  }
+
   return {
-    plugins: [react()],
-    server: { port: 3000 },
-    define: {
-      'import.meta.env.VITE_GROQ_P7_KEY': JSON.stringify(env.GROQ_P7_KEY || env.VITE_GROQ_P7_KEY || ''),
-      'import.meta.env.VITE_DEFAULT_LANGUAGE': JSON.stringify(env.VITE_DEFAULT_LANGUAGE || 'en'),
+    name: 'groq-stt-proxy',
+    configureServer(server) {
+      attach(server.middlewares, server.config.mode)
+    },
+    configurePreviewServer(server) {
+      attach(server.middlewares, server.config.mode)
     },
   }
+}
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react(), groqProxyPlugin()],
+  // Client bundles may only see non-secret settings. Groq credentials stay in
+  // the Node process that serves /api/stt and are never assigned to import.meta.env.
+  envPrefix: ['VITE_DEFAULT_', 'VITE_DEBUG_'],
+  server: { port: 3000 },
 })
