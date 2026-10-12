@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { Header } from './components/Layout/Header';
 import { PrototypeLayout } from './components/Layout/PrototypeLayout';
 import { AudioControls } from './components/AudioCapture/AudioControls';
@@ -8,11 +8,33 @@ import { ChatThread } from './components/Transcript/ChatThread';
 import { useAudioCapture } from './hooks/useAudioCapture';
 import { useDisplayAudioCapture } from './hooks/useDisplayAudioCapture';
 import { useTranscription } from './hooks/useTranscription';
+import { useAggregatedTranscription } from './hooks/useAggregatedTranscription';
+
+type KeySource = 'unknown' | 'server' | 'session' | 'none';
 
 function App() {
-  // Use Groq API key from env (Vite exposes only VITE_* vars)
-  const [apiKey, setApiKey] = useState<string>(import.meta.env.VITE_GROQ_P7_KEY || '');
-  const [isConfigured, setIsConfigured] = useState<boolean>(!!import.meta.env.VITE_GROQ_P7_KEY);
+  // Session keys live in memory only. The shared Groq key stays on the server.
+  const [apiKey, setApiKey] = useState<string>('');
+  const [keySource, setKeySource] = useState<KeySource>('unknown');
+  const isConfigured = keySource === 'server' || keySource === 'session';
+  const stopMicRef = useRef<() => Promise<void>>(async () => {});
+  const stopShareRef = useRef<() => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/stt/status')
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('status unavailable')))
+      .then((data: { configured?: boolean }) => {
+        if (cancelled) return;
+        setKeySource(data.configured ? 'server' : 'none');
+      })
+      .catch(() => {
+        if (!cancelled) setKeySource('none');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Mic capture
   const {
@@ -27,7 +49,9 @@ function App() {
     pauseRecording,
     resumeRecording,
     clearError,
-  } = useAudioCapture();
+  } = useAudioCapture({
+    onMaxDuration: () => { void stopMicRef.current(); },
+  });
 
   // Display/tab audio capture
   const {
@@ -40,7 +64,9 @@ function App() {
     stopRecording: stopShareRecording,
     pauseRecording: pauseShareRecording,
     resumeRecording: resumeShareRecording,
-  } = useDisplayAudioCapture();
+  } = useDisplayAudioCapture({
+    onMaxDuration: () => { void stopShareRef.current(); },
+  });
 
   // Transcription hook (Groq STT)
   const {
@@ -49,16 +75,17 @@ function App() {
     wordCount: micWordCount,
     averageConfidence: micAvgConf,
     processAudio: processMicAudio,
+    cancel: cancelMic,
     clearTranscript: clearMicTranscript,
   } = useTranscription({
-    apiKey,
+    apiKey: keySource === 'session' ? apiKey : undefined,
     language: import.meta.env.VITE_DEFAULT_LANGUAGE || 'en',
     task: 'transcribe',
     enableTimestamps: true,
     model: 'whisper-large-v3-turbo',
-  timestampGranularities: ['segment', 'word'],
+    timestampGranularities: ['segment', 'word'],
     sourceId: 'mic',
-  appendMode: false,
+    appendMode: false,
   });
 
   const {
@@ -67,55 +94,29 @@ function App() {
     wordCount: shareWordCount,
     averageConfidence: shareAvgConf,
     processAudio: processShareAudio,
+    cancel: cancelShare,
     clearTranscript: clearShareTranscript,
   } = useTranscription({
-    apiKey,
+    apiKey: keySource === 'session' ? apiKey : undefined,
     language: import.meta.env.VITE_DEFAULT_LANGUAGE || 'en',
     task: 'transcribe',
     enableTimestamps: true,
     model: 'whisper-large-v3-turbo',
-  timestampGranularities: ['segment', 'word'],
+    timestampGranularities: ['segment', 'word'],
     sourceId: 'share',
-  appendMode: false,
+    appendMode: false,
   });
 
-  // Simple in-flight queue to avoid overlapping chunk requests
-  // Per-source in-flight queues
-  const inFlightRefMic = useRef(false);
-  const pendingRefMic = useRef(false);
-  const accumulatedChunksRefMic = useRef<Blob[]>([]);
-
-  const inFlightRefShare = useRef(false);
-  const pendingRefShare = useRef(false);
-  const accumulatedChunksRefShare = useRef<Blob[]>([]);
-
-  const buildAggregatedBlob = useCallback((chunks: Blob[]) => new Blob(chunks, { type: 'audio/webm' }), []);
-
-  const submitAggregatedMic = useCallback(async () => {
-    if (inFlightRefMic.current) { pendingRefMic.current = true; return; }
-    const blob = buildAggregatedBlob(accumulatedChunksRefMic.current);
-    if (!blob || blob.size === 0) return;
-    inFlightRefMic.current = true;
-    try { await processMicAudio(blob); }
-    catch (e) { console.error('Mic aggregated transcription failed', e); }
-    finally {
-      inFlightRefMic.current = false;
-      if (pendingRefMic.current) { pendingRefMic.current = false; submitAggregatedMic(); }
-    }
-  }, [buildAggregatedBlob, processMicAudio]);
-
-  const submitAggregatedShare = useCallback(async () => {
-    if (inFlightRefShare.current) { pendingRefShare.current = true; return; }
-    const blob = buildAggregatedBlob(accumulatedChunksRefShare.current);
-    if (!blob || blob.size === 0) return;
-    inFlightRefShare.current = true;
-    try { await processShareAudio(blob); }
-    catch (e) { console.error('Share aggregated transcription failed', e); }
-    finally {
-      inFlightRefShare.current = false;
-      if (pendingRefShare.current) { pendingRefShare.current = false; submitAggregatedShare(); }
-    }
-  }, [buildAggregatedBlob, processShareAudio]);
+  const micAggregate = useAggregatedTranscription({
+    processAudio: processMicAudio,
+    cancel: cancelMic,
+    label: 'Mic',
+  });
+  const shareAggregate = useAggregatedTranscription({
+    processAudio: processShareAudio,
+    cancel: cancelShare,
+    label: 'Share',
+  });
 
   // Initialize audio on first use
   const handleStartRecording = useCallback(async () => {
@@ -125,77 +126,64 @@ function App() {
         return;
       }
 
-      // reset accumulators (mic)
-      accumulatedChunksRefMic.current = [];
-      inFlightRefMic.current = false;
-      pendingRefMic.current = false;
+      micAggregate.startSession();
 
       await initialize();
       // Start recording and stream aggregate for near real-time transcription
       await startRecording((chunk) => {
         if (chunk?.data && chunk.data.size > 0) {
-          accumulatedChunksRefMic.current.push(chunk.data);
-          submitAggregatedMic();
+          micAggregate.pushChunk(chunk.data);
         }
       });
     } catch (error) {
       console.error('Failed to start recording:', error);
     }
-  }, [initialize, startRecording, isConfigured, submitAggregatedMic]);
+  }, [initialize, startRecording, isConfigured, micAggregate]);
 
   const handleStopRecording = useCallback(async () => {
+    let finalBlob: Blob | null = null;
     try {
-      const finalBlob = await stopRecording();
-      if (finalBlob) {
-        // Replace accumulator with the finalized single container
-        accumulatedChunksRefMic.current = [finalBlob];
-        pendingRefMic.current = false;
-        inFlightRefMic.current = false;
-        await submitAggregatedMic();
-      }
+      finalBlob = await stopRecording();
     } catch (error) {
       console.error('Failed to stop recording:', error);
     }
-  }, [stopRecording, submitAggregatedMic]);
+    await micAggregate.finishSession(finalBlob);
+  }, [stopRecording, micAggregate]);
 
   // Display share handlers
   const handleStartShare = useCallback(async () => {
     try {
       if (!isConfigured) { alert('Please enter your Groq API key first'); return; }
-      accumulatedChunksRefShare.current = [];
-      inFlightRefShare.current = false;
-      pendingRefShare.current = false;
+      shareAggregate.startSession();
       await initializeShare();
       await startShareRecording((chunk) => {
         if (chunk?.data && chunk.data.size > 0) {
-          accumulatedChunksRefShare.current.push(chunk.data);
-          submitAggregatedShare();
+          shareAggregate.pushChunk(chunk.data);
         }
       });
     } catch (e) {
       console.error('Failed to start share recording:', e);
     }
-  }, [initializeShare, startShareRecording, isConfigured, submitAggregatedShare]);
+  }, [initializeShare, startShareRecording, isConfigured, shareAggregate]);
 
   const handleStopShare = useCallback(async () => {
+    let finalBlob: Blob | null = null;
     try {
-      const finalBlob = await stopShareRecording();
-      if (finalBlob) {
-        accumulatedChunksRefShare.current = [finalBlob];
-        pendingRefShare.current = false;
-        inFlightRefShare.current = false;
-        await submitAggregatedShare();
-      }
+      finalBlob = await stopShareRecording();
     } catch (e) {
       console.error('Failed to stop share recording:', e);
     }
-  }, [stopShareRecording, submitAggregatedShare]);
+    await shareAggregate.finishSession(finalBlob);
+  }, [stopShareRecording, shareAggregate]);
+
+  stopMicRef.current = handleStopRecording;
+  stopShareRef.current = handleStopShare;
 
   const handleConfigureAPI = useCallback(() => {
-    const key = prompt('Enter your Groq API key:');
-    if (key) {
-      setApiKey(key);
-      setIsConfigured(true);
+    const key = prompt('Enter a Groq API key for this browser session. It is kept in memory only.');
+    if (key && key.trim()) {
+      setApiKey(key.trim());
+      setKeySource('session');
     }
   }, []);
 
@@ -208,16 +196,16 @@ function App() {
       
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* API Configuration */}
-        {!isConfigured && (
+        {keySource === 'none' && (
           <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-sm font-medium text-blue-900">API Configuration Required</h3>
                 <p className="text-sm text-blue-700 mt-1">
-                  Add your Groq API key to your .env.local file or enter it manually.
+                  Set GROQ_P7_KEY for the dev server, or enter a key for this browser session.
                 </p>
                 <p className="text-xs text-blue-600 mt-1">
-                  Tip: Add VITE_GROQ_P7_KEY=your_key to .env.local for automatic loading
+                  Session keys stay in memory and are not written into the app bundle.
                 </p>
               </div>
               <button
@@ -244,7 +232,7 @@ function App() {
             <div className="flex items-center space-x-2 text-sm text-gray-600">
               <div className="w-2 h-2 bg-green-500 rounded-full"></div>
               <span>
-                API Configured {import.meta.env.VITE_GROQ_P7_KEY ? '(from .env.local)' : '(manual)'}
+                {keySource === 'server' ? 'API configured on the server' : 'Session key only (not saved)'}
               </span>
             </div>
           )}

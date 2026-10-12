@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { AudioCaptureService } from '../services/audioCapture';
 import { AudioCaptureState, AudioChunk, AudioError } from '../types/audio';
+import { AUDIO_CONFIG } from '../utils/constants';
 
-export function useAudioCapture() {
+export function useAudioCapture(options: { onMaxDuration?: () => void } = {}) {
   const [state, setState] = useState<AudioCaptureState>({
     isRecording: false,
     isPaused: false,
@@ -14,6 +15,9 @@ export function useAudioCapture() {
   const captureServiceRef = useRef<AudioCaptureService | null>(null);
   const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<number>(0);
+  const cappedRef = useRef(false);
+  const onMaxDurationRef = useRef(options.onMaxDuration);
+  onMaxDurationRef.current = options.onMaxDuration;
 
   // Initialize audio capture service
   const initialize = useCallback(async (): Promise<void> => {
@@ -47,6 +51,7 @@ export function useAudioCapture() {
       await captureServiceRef.current!.startRecording(onChunk);
       
       startTimeRef.current = Date.now();
+      cappedRef.current = false;
       setState(prev => ({ 
         ...prev, 
         isRecording: true, 
@@ -56,8 +61,18 @@ export function useAudioCapture() {
 
       // Start duration tracking
       durationIntervalRef.current = setInterval(() => {
-        const duration = (Date.now() - startTimeRef.current) / 1000;
+        const elapsedMs = Date.now() - startTimeRef.current;
+        const duration = elapsedMs / 1000;
         setState(prev => ({ ...prev, totalDuration: duration }));
+        if (!cappedRef.current && elapsedMs >= AUDIO_CONFIG.MAX_RECORDING_DURATION) {
+          cappedRef.current = true;
+          const limitMinutes = Math.round(AUDIO_CONFIG.MAX_RECORDING_DURATION / 60000);
+          setState(prev => ({
+            ...prev,
+            error: `Recording stopped at the ${limitMinutes} minute limit.`,
+          }));
+          onMaxDurationRef.current?.();
+        }
       }, 100);
 
     } catch (error) {

@@ -113,6 +113,8 @@ temp/
 api-keys.txt
 config/secrets.json
 
+# .env.example is a template with empty values and is safe to commit.
+
 # Audio files (for testing)
 *.wav
 *.mp3
@@ -140,4 +142,3 @@ ehthumbs.db
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-.env.example

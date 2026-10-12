@@ -1,12 +1,13 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { AudioCaptureService } from '../services/audioCapture';
 import { AudioCaptureState, AudioChunk, AudioError } from '../types/audio';
+import { AUDIO_CONFIG } from '../utils/constants';
 
 /**
  * Hook to capture audio from a shared tab/window using getDisplayMedia.
  * Mirrors the API of useAudioCapture so App can use both sources similarly.
  */
-export function useDisplayAudioCapture() {
+export function useDisplayAudioCapture(options: { onMaxDuration?: () => void } = {}) {
   const [state, setState] = useState<AudioCaptureState>({
     isRecording: false,
     isPaused: false,
@@ -18,6 +19,9 @@ export function useDisplayAudioCapture() {
   const captureServiceRef = useRef<AudioCaptureService | null>(null);
   const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<number>(0);
+  const cappedRef = useRef(false);
+  const onMaxDurationRef = useRef(options.onMaxDuration);
+  onMaxDurationRef.current = options.onMaxDuration;
 
   const initialize = useCallback(async (): Promise<void> => {
     try {
@@ -53,6 +57,7 @@ export function useDisplayAudioCapture() {
       await captureServiceRef.current!.startRecording(onChunk);
 
       startTimeRef.current = Date.now();
+      cappedRef.current = false;
       setState(prev => ({
         ...prev,
         isRecording: true,
@@ -61,8 +66,18 @@ export function useDisplayAudioCapture() {
       }));
 
       durationIntervalRef.current = setInterval(() => {
-        const duration = (Date.now() - startTimeRef.current) / 1000;
+        const elapsedMs = Date.now() - startTimeRef.current;
+        const duration = elapsedMs / 1000;
         setState(prev => ({ ...prev, totalDuration: duration }));
+        if (!cappedRef.current && elapsedMs >= AUDIO_CONFIG.MAX_RECORDING_DURATION) {
+          cappedRef.current = true;
+          const limitMinutes = Math.round(AUDIO_CONFIG.MAX_RECORDING_DURATION / 60000);
+          setState(prev => ({
+            ...prev,
+            error: `Recording stopped at the ${limitMinutes} minute limit.`,
+          }));
+          onMaxDurationRef.current?.();
+        }
       }, 100);
     } catch (error) {
       const audioError = error as AudioError;
